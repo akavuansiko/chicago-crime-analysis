@@ -39,9 +39,9 @@ chicago-crime-analysis/
 
 │   ├── pattern_mining.ipynb
 
-│   ├── forecasting.ipynb
+│   ├── temporal_analysis.ipynb
 
-│   └── spatial.ipynb
+│   └── spatial_analysis_v1.ipynb
 
 ├── dashboard/
 
