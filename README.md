@@ -39,9 +39,9 @@ chicago-crime-analysis/
 
 │   ├── pattern_mining.ipynb
 
-│   ├── forecasting.ipynb
+│   ├── temporal_analysis.ipynb
 
-│   └── spatial.ipynb
+│   └── spatial_analysis_v1.ipynb
 
 ├── dashboard/
 
@@ -97,12 +97,51 @@ pip install pandas plotly geopandas scikit-learn mlxtend prophet dash jupyter
 jupyter notebook notebooks/
 ```
 
-### Lancer le dashboard
+### 1. Installer les dépendances
+
+```bash
+python -m pip install -r dashboard/requirements.txt
+```
+
+La commande suivante est également valable lorsque `pip` est correctement configuré :
+
+```bash
+pip install -r dashboard/requirements.txt
+```
+
+L’installation n’est nécessaire qu’une première fois ou lorsque le fichier `requirements.txt` est modifié.
+
+### 2. Lancer le dashboard
+
 ```bash
 python dashboard/app.py
 ```
 
----
+Le dashboard est ensuite accessible dans un navigateur à l’adresse suivante :
+
+```text
+http://127.0.0.1:8050
+```
+
+Pour arrêter le serveur, utiliser le raccourci :
+
+```text
+Ctrl + C
+```
+
+### 3. Utiliser un autre port
+
+Si le port `8050` est déjà occupé :
+
+```bash
+python dashboard/app.py --port 8051
+```
+
+Le dashboard sera alors disponible à l’adresse :
+
+```text
+http://127.0.0.1:8051
+```
 
 ## 🗓️ Présentation orale
 **17 juin 2025** — Présentation groupe + démo solo (questions sur le code)
