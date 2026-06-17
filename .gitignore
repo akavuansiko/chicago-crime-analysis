@@ -4,3 +4,5 @@ notebooks/spatial_analysis_v2_api.ipynb
 .idea/
 anaconda_projects/
 *.db
+data/chicago_crimes_citywide_cache.csv
+data/chicago_monthly_citywide_cache.csv

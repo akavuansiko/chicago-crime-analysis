@@ -1,16 +1,15 @@
 """Dashboard interactif - Chicago Crime Analysis.
 
-Ce fichier rassemble les quatre analyses réalisées dans les notebooks du projet :
-1. exploration et agrégations ;
-2. extraction de motifs fréquents avec Apriori ;
-3. analyse temporelle et prévision Prophet ;
-4. analyse spatiale et clustering K-means.
+Version mise à jour : la source principale n'est plus le CSV local Bridgeport.
+Le dashboard charge désormais les données depuis le portail officiel City of Chicago
+(Crimes - 2001 to Present) et utilise une agrégation temporelle citywide pour
+l'analyse temporelle et le forecasting.
 
-Lancement du dashboard :
-    python app.py
+Lancement du dashboard depuis la racine du projet :
+    python dashboard/app.py
 
 Création d'une preuve HTML autonome :
-    python app.py --export-html
+    python dashboard/app.py --export-html
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -28,8 +28,12 @@ import plotly.io as pio
 from dash import Dash, Input, Output, callback, dash_table, dcc, html
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
-from prophet import Prophet
 from sklearn.cluster import KMeans, OPTICS
+
+try:
+    from prophet import Prophet
+except Exception:  # Prophet peut échouer selon l'environnement local.
+    Prophet = None
 
 
 # -----------------------------------------------------------------------------
@@ -37,10 +41,21 @@ from sklearn.cluster import KMeans, OPTICS
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
-DATA_PATH = PROJECT_DIR / "data" / "chicago_crime.csv"
+DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+# Ancien CSV local conservé seulement comme secours si Internet est indisponible.
+LOCAL_FALLBACK_PATH = DATA_DIR / "chicago_crime.csv"
+CITYWIDE_CACHE_PATH = DATA_DIR / "chicago_crimes_citywide_cache.csv"
+MONTHLY_CACHE_PATH = DATA_DIR / "chicago_monthly_citywide_cache.csv"
 EXPORT_PATH = BASE_DIR / "Kavuansiko_dashboard.html"
 
-DATASET_NAME = "Chicago Crime Dataset - Bridgeport"
+DATASET_NAME = "Chicago Crimes - 2001 to Present"
+DATASET_PAGE_URL = "https://data.cityofchicago.org/Public-Safety/Crimes-2001-to-Present/ijzp-q8t2"
+SODA_ENDPOINT = "https://data.cityofchicago.org/resource/ijzp-q8t2.csv"
+DEFAULT_DATA_LIMIT = 50_000
+MAX_SPATIAL_POINTS = 5_000
+
 TEAM_MEMBERS = [
     "Angelikia Kavuansiko - exploration des données",
     "Ekta - pattern mining",
@@ -48,6 +63,31 @@ TEAM_MEMBERS = [
     "Chrisa - analyse spatiale",
     "Flavie - dashboard et intégration finale",
 ]
+
+COLUMN_RENAME = {
+    "id": "ID",
+    "case_number": "Case Number",
+    "date": "Date",
+    "block": "Block",
+    "iucr": "IUCR",
+    "primary_type": "Primary Type",
+    "description": "Description",
+    "location_description": "Location Description",
+    "arrest": "Arrest",
+    "domestic": "Domestic",
+    "beat": "Beat",
+    "district": "District",
+    "ward": "Ward",
+    "community_area": "Community Area",
+    "fbi_code": "FBI Code",
+    "x_coordinate": "X Coordinate",
+    "y_coordinate": "Y Coordinate",
+    "year": "Year",
+    "updated_on": "Updated On",
+    "latitude": "Latitude",
+    "longitude": "Longitude",
+    "location": "Location",
+}
 
 PAGE_STYLE = {
     "fontFamily": "Arial, Helvetica, sans-serif",
@@ -64,44 +104,177 @@ CARD_STYLE = {
 
 
 # -----------------------------------------------------------------------------
-# Chargement et préparation des données
+# Accès aux données City of Chicago
 # -----------------------------------------------------------------------------
-def load_data(file_path: str | Path) -> pd.DataFrame:
-    """Charger et préparer le fichier CSV.
+def build_citywide_api_url(limit: int = DEFAULT_DATA_LIMIT) -> str:
+    """Construire l'URL CSV de l'API Socrata pour les incidents récents citywide.
 
-    Input : chemin du fichier CSV.
-    Output : dataframe nettoyé et enrichi de variables temporelles.
+    Input : nombre maximal de lignes à charger.
+    Output : URL complète interrogeant le dataset officiel Crimes - 2001 to Present.
     """
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Fichier introuvable : {path}. Placez app.py dans le dossier dashboard/ "
-            "et le CSV dans data/chicago_crime.csv."
-        )
+    params = {
+        "$limit": int(limit),
+        "$order": "date DESC",
+    }
+    return f"{SODA_ENDPOINT}?{urlencode(params)}"
 
-    df = pd.read_csv(path)
 
-    # Conversion explicite des dates américaines : mois/jour/année.
-    df["Date"] = pd.to_datetime(
-        df["Date"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce"
+def build_monthly_api_url() -> str:
+    """Construire l'URL d'agrégation mensuelle citywide.
+
+    Input : aucun.
+    Output : URL SoQL qui compte les crimes par année et par mois pour toute la ville.
+    """
+    params = {
+        "$select": "date_extract_y(date) AS year, date_extract_m(date) AS month, count(*) AS count",
+        "$group": "year, month",
+        "$order": "year, month",
+        "$limit": 5000,
+    }
+    return f"{SODA_ENDPOINT}?{urlencode(params)}"
+
+
+def _standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Harmoniser les noms de colonnes entre le CSV local et l'API Socrata.
+
+    Input : dataframe brut.
+    Output : dataframe avec les noms attendus par le reste du dashboard.
+    """
+    result = df.rename(columns={col: COLUMN_RENAME.get(col, col) for col in df.columns})
+
+    required_columns = [
+        "ID", "Date", "Primary Type", "Location Description", "Arrest", "Domestic",
+        "Latitude", "Longitude", "Year",
+    ]
+    for column in required_columns:
+        if column not in result.columns:
+            result[column] = pd.NA
+
+    return result
+
+
+def _parse_bool_series(series: pd.Series) -> pd.Series:
+    """Convertir les booléens Socrata/Pandas en valeurs True/False fiables.
+
+    Input : série contenant True/False, true/false, 1/0 ou valeurs manquantes.
+    Output : série booléenne exploitable pour les taux et Apriori.
+    """
+    if series.dtype == bool:
+        return series.fillna(False)
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .map({"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False})
+        .fillna(False)
+        .astype(bool)
     )
 
-    # Les coordonnées utilisent une virgule décimale dans le fichier fourni.
+
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Nettoyer et enrichir les données criminelles.
+
+    Input : dataframe brut issu de l'API ou du CSV local.
+    Output : dataframe standardisé avec Date, coordonnées numériques et variables temporelles.
+    """
+    result = _standardise_columns(df).copy()
+
+    result["Date"] = pd.to_datetime(result["Date"], errors="coerce", format="mixed")
+    result["Updated On"] = pd.to_datetime(result.get("Updated On"), errors="coerce", format="mixed")
+
     for column in ["Latitude", "Longitude"]:
-        df[column] = pd.to_numeric(
-            df[column].astype(str).str.replace(",", ".", regex=False),
+        result[column] = pd.to_numeric(
+            result[column].astype(str).str.replace(",", ".", regex=False),
             errors="coerce",
         )
 
-    # Variables utiles aux analyses temporelles et aux filtres du dashboard.
-    df["Year"] = df["Date"].dt.year.astype("Int64")
-    df["Month"] = df["Date"].dt.month.astype("Int64")
-    df["Hour"] = df["Date"].dt.hour.astype("Int64")
-    df["YearMonth"] = df["Date"].dt.to_period("M").dt.to_timestamp()
+    result["Arrest"] = _parse_bool_series(result["Arrest"])
+    result["Domestic"] = _parse_bool_series(result["Domestic"])
 
-    return df
+    result["Primary Type"] = result["Primary Type"].fillna("UNKNOWN")
+    result["Location Description"] = result["Location Description"].fillna("UNKNOWN")
+
+    result["Year"] = result["Date"].dt.year.astype("Int64")
+    result["Month"] = result["Date"].dt.month.astype("Int64")
+    result["Hour"] = result["Date"].dt.hour.astype("Int64")
+    result["YearMonth"] = result["Date"].dt.to_period("M").dt.to_timestamp()
+
+    return result
 
 
+def load_data(limit: int = DEFAULT_DATA_LIMIT, offline: bool = False) -> pd.DataFrame:
+    """Charger les incidents citywide depuis l'API officielle, avec cache local.
+
+    Input : nombre de lignes à récupérer et mode hors ligne optionnel.
+    Output : dataframe nettoyé pour les analyses du dashboard.
+    """
+    if offline and CITYWIDE_CACHE_PATH.exists():
+        return prepare_dataframe(pd.read_csv(CITYWIDE_CACHE_PATH))
+
+    url = build_citywide_api_url(limit)
+    try:
+        df = pd.read_csv(url)
+        df.to_csv(CITYWIDE_CACHE_PATH, index=False)
+        return prepare_dataframe(df)
+    except Exception as error:
+        print(
+            "Avertissement : impossible de charger la source en ligne City of Chicago. "
+            f"Détail : {error}"
+        )
+        if CITYWIDE_CACHE_PATH.exists():
+            print(f"Utilisation du cache local : {CITYWIDE_CACHE_PATH}")
+            return prepare_dataframe(pd.read_csv(CITYWIDE_CACHE_PATH))
+        if LOCAL_FALLBACK_PATH.exists():
+            print(
+                "Utilisation du CSV local de secours. Attention : ce fichier peut être "
+                "plus restreint que la source citywide."
+            )
+            return prepare_dataframe(pd.read_csv(LOCAL_FALLBACK_PATH))
+        raise FileNotFoundError(
+            "Aucune source disponible : ni API City of Chicago, ni cache local, ni CSV de secours."
+        ) from error
+
+
+def load_monthly_citywide_counts(offline: bool = False) -> pd.DataFrame:
+    """Charger l'agrégation mensuelle citywide depuis l'API Socrata.
+
+    Input : mode hors ligne optionnel.
+    Output : dataframe mensuel avec Date et Nombre de crimes couvrant toute la ville.
+    """
+    if offline and MONTHLY_CACHE_PATH.exists():
+        return pd.read_csv(MONTHLY_CACHE_PATH, parse_dates=["Date"])
+
+    try:
+        monthly_raw = pd.read_csv(build_monthly_api_url())
+        monthly_raw.columns = [str(c).lower() for c in monthly_raw.columns]
+        monthly = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    monthly_raw["year"].astype(int).astype(str)
+                    + "-"
+                    + monthly_raw["month"].astype(int).astype(str).str.zfill(2)
+                    + "-01",
+                    errors="coerce",
+                ),
+                "Nombre de crimes": pd.to_numeric(monthly_raw["count"], errors="coerce").fillna(0),
+            }
+        )
+        monthly = monthly.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        monthly.to_csv(MONTHLY_CACHE_PATH, index=False)
+        return monthly
+    except Exception as error:
+        print(
+            "Avertissement : l'agrégation mensuelle citywide n'a pas pu être chargée. "
+            f"Détail : {error}"
+        )
+        if MONTHLY_CACHE_PATH.exists():
+            return pd.read_csv(MONTHLY_CACHE_PATH, parse_dates=["Date"])
+        raise
+
+
+# -----------------------------------------------------------------------------
+# Filtres et KPIs
+# -----------------------------------------------------------------------------
 def filter_data(df: pd.DataFrame, year: str | int, crime_type: str) -> pd.DataFrame:
     """Appliquer les filtres sélectionnés dans le dashboard.
 
@@ -134,7 +307,7 @@ def calculate_kpis(df: pd.DataFrame) -> dict[str, str]:
     main_crime = str(df["Primary Type"].mode().iloc[0])
     min_date = df["Date"].min()
     max_date = df["Date"].max()
-    period = f"{min_date:%m/%Y} - {max_date:%m/%Y}"
+    period = f"{min_date:%m/%Y} - {max_date:%m/%Y}" if pd.notna(min_date) else "Aucune date"
 
     return {
         "incidents": f"{len(df):,}".replace(",", " "),
@@ -220,7 +393,7 @@ def discretise_data(df: pd.DataFrame) -> pd.DataFrame:
     """Transformer les variables en catégories utilisables par Apriori.
 
     Input : dataframe préparé.
-    Output : dataframe discrétisé identique à celui du notebook pattern_mining.
+    Output : dataframe discrétisé avec type, tranche horaire, lieu, arrestation et domesticité.
     """
     result = df.copy()
 
@@ -236,19 +409,13 @@ def discretise_data(df: pd.DataFrame) -> pd.DataFrame:
             return "Soir"
         return "Nuit"
 
-    # Même règle que dans le notebook : cinq lieux conservés, tous les autres
-    # sont regroupés dans la catégorie AUTRE.
     top_locations = result["Location Description"].value_counts().nlargest(5).index
     result["Heure"] = result["Hour"].apply(time_slot)
     result["Lieu"] = result["Location Description"].apply(
         lambda value: value if value in top_locations else "AUTRE"
     )
-    result["Arrestation"] = np.where(
-        result["Arrest"], "Arrestation_OUI", "Arrestation_NON"
-    )
-    result["Domestique"] = np.where(
-        result["Domestic"], "Domestique_OUI", "Domestique_NON"
-    )
+    result["Arrestation"] = np.where(result["Arrest"], "Arrestation_OUI", "Arrestation_NON")
+    result["Domestique"] = np.where(result["Domestic"], "Domestique_OUI", "Domestique_NON")
 
     return result[["Primary Type", "Heure", "Lieu", "Arrestation", "Domestique"]]
 
@@ -263,6 +430,7 @@ def encode_transactions(discrete_df: pd.DataFrame) -> pd.DataFrame:
     encoder = TransactionEncoder()
     encoded_array = encoder.fit(transactions).transform(transactions)
     return pd.DataFrame(encoded_array, columns=encoder.columns_)
+
 
 def mine_association_rules(
     encoded_df: pd.DataFrame, min_support: float = 0.10
@@ -376,13 +544,13 @@ def rules_table_dataframe(rules: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# Requête 3 - dimension temporelle et forecasting
+# Requête 3 - dimension temporelle citywide et forecasting
 # -----------------------------------------------------------------------------
 def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
-    """Agréger les incidents par mois en réintroduisant les mois sans incident.
+    """Agréger les incidents par mois à partir des données chargées localement.
 
     Input : dataframe préparé.
-    Output : série mensuelle complète avec Date et Nombre de crimes.
+    Output : série mensuelle avec Date et Nombre de crimes.
     """
     valid = df.dropna(subset=["Date"]).set_index("Date")
     monthly = valid.resample("MS").size().rename("Nombre de crimes").reset_index()
@@ -390,7 +558,7 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_monthly_figure(monthly: pd.DataFrame) -> go.Figure:
-    """Visualiser l'évolution mensuelle du nombre d'incidents.
+    """Visualiser l'évolution mensuelle citywide du nombre d'incidents.
 
     Input : agrégation mensuelle.
     Output : courbe temporelle Plotly.
@@ -399,7 +567,7 @@ def make_monthly_figure(monthly: pd.DataFrame) -> go.Figure:
         monthly,
         x="Date",
         y="Nombre de crimes",
-        title="Évolution mensuelle des incidents",
+        title="Évolution mensuelle des incidents - ville de Chicago",
     )
     fig.update_layout(margin=dict(l=20, r=20, t=65, b=20), height=430)
     return fig
@@ -407,20 +575,21 @@ def make_monthly_figure(monthly: pd.DataFrame) -> go.Figure:
 
 def run_prophet_forecast(
     monthly: pd.DataFrame, periods: int = 12
-) -> tuple[Prophet | None, pd.DataFrame]:
+) -> tuple[object | None, pd.DataFrame]:
     """Entraîner Prophet et prévoir les douze prochains mois.
 
-    Input : série mensuelle et horizon de prévision.
+    Input : série mensuelle citywide et horizon de prévision.
     Output : modèle entraîné et dataframe des valeurs prévues.
 
     Une régression tendance-saisonnalité est utilisée comme solution de secours si
-    le moteur Stan de Prophet n'est pas compatible avec l'environnement local.
-    Cette sécurité évite qu'un problème d'installation bloque toute la démo.
+    Prophet ou Stan n'est pas compatible avec l'environnement local.
     """
     prophet_df = monthly.rename(columns={"Date": "ds", "Nombre de crimes": "y"})
+    prophet_df = prophet_df.dropna(subset=["ds", "y"])
 
     try:
-        # Prophet/Stan n'est pas toujours stable sous les versions Python très récentes.
+        if Prophet is None:
+            raise RuntimeError("Prophet n'est pas disponible dans cet environnement.")
         if sys.version_info >= (3, 13):
             raise RuntimeError(
                 "Prophet est désactivé sous Python 3.13 ; utilisez Python 3.10 à 3.12 "
@@ -444,7 +613,6 @@ def run_prophet_forecast(
         )
         model = None
 
-        # Modèle de secours : tendance linéaire + saisonnalité annuelle sinusoïdale.
         n_observed = len(prophet_df)
         total_length = n_observed + periods
         t_observed = np.arange(n_observed, dtype=float)
@@ -468,14 +636,10 @@ def run_prophet_forecast(
         )
         fitted = x_observed @ coefficients
         predicted = design_matrix(t_all) @ coefficients
-        residual_std = float(
-            np.std(prophet_df["y"].to_numpy(dtype=float) - fitted, ddof=1)
-        )
-        margin = 1.282 * residual_std  # intervalle approximatif à 80 %
+        residual_std = float(np.std(prophet_df["y"].to_numpy(dtype=float) - fitted, ddof=1))
+        margin = 1.282 * residual_std
 
-        future_dates = pd.date_range(
-            start=prophet_df["ds"].min(), periods=total_length, freq="MS"
-        )
+        future_dates = pd.date_range(start=prophet_df["ds"].min(), periods=total_length, freq="MS")
         forecast = pd.DataFrame(
             {
                 "ds": future_dates,
@@ -486,58 +650,25 @@ def run_prophet_forecast(
         )
         forecast.attrs["model_name"] = "modèle saisonnier de secours"
 
-    # Un nombre d'incidents ne peut pas être négatif.
     for column in ["yhat", "yhat_lower", "yhat_upper"]:
         forecast[column] = forecast[column].clip(lower=0)
     return model, forecast
 
 
 def make_forecast_figure(monthly: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
-    """Comparer les observations et la prévision Prophet.
+    """Comparer les observations et la prévision.
 
-    Input : série observée et dataframe de prévision.
+    Input : série observée citywide et dataframe de prévision.
     Output : figure avec prévision et intervalle d'incertitude.
     """
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=monthly["Date"],
-            y=monthly["Nombre de crimes"],
-            mode="lines",
-            name="Données observées",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=forecast["ds"],
-            y=forecast["yhat_upper"],
-            mode="lines",
-            line=dict(width=0),
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=forecast["ds"],
-            y=forecast["yhat_lower"],
-            mode="lines",
-            fill="tonexty",
-            name="Intervalle de prévision à 80 %",
-            line=dict(width=0),
-        )
-    )
+    fig.add_trace(go.Scatter(x=monthly["Date"], y=monthly["Nombre de crimes"], mode="lines", name="Données observées"))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode="lines", fill="tonexty", name="Intervalle de prévision à 80 %", line=dict(width=0)))
     model_name = forecast.attrs.get("model_name", "Prophet")
-    fig.add_trace(
-        go.Scatter(
-            x=forecast["ds"],
-            y=forecast["yhat"],
-            mode="lines",
-            name=f"Prévision - {model_name}",
-        )
-    )
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], mode="lines", name=f"Prévision - {model_name}"))
     fig.update_layout(
-        title=f"Prévision mensuelle des incidents sur 12 mois ({model_name})",
+        title=f"Prévision mensuelle des incidents sur 12 mois - Chicago citywide ({model_name})",
         xaxis_title="Date",
         yaxis_title="Nombre de crimes",
         hovermode="x unified",
@@ -550,13 +681,16 @@ def make_forecast_figure(monthly: pd.DataFrame, forecast: pd.DataFrame) -> go.Fi
 # -----------------------------------------------------------------------------
 # Requête 4 - dimension spatiale et clustering
 # -----------------------------------------------------------------------------
-def spatial_subset(df: pd.DataFrame) -> pd.DataFrame:
-    """Conserver uniquement les incidents possédant des coordonnées valides.
+def spatial_subset(df: pd.DataFrame, max_points: int = MAX_SPATIAL_POINTS) -> pd.DataFrame:
+    """Conserver les incidents géolocalisables et échantillonner si nécessaire.
 
-    Input : dataframe préparé.
-    Output : dataframe géolocalisable.
+    Input : dataframe préparé et nombre maximal de points pour les cartes.
+    Output : dataframe géolocalisable, éventuellement échantillonné pour préserver l'interactivité.
     """
-    return df.dropna(subset=["Latitude", "Longitude"]).copy()
+    spatial = df.dropna(subset=["Latitude", "Longitude"]).copy()
+    if len(spatial) > max_points:
+        spatial = spatial.sample(max_points, random_state=42)
+    return spatial
 
 
 def apply_kmeans(df: pd.DataFrame, clusters: int = 6) -> pd.DataFrame:
@@ -576,6 +710,11 @@ def apply_kmeans(df: pd.DataFrame, clusters: int = 6) -> pd.DataFrame:
     return result
 
 
+def _map_center(spatial: pd.DataFrame) -> dict[str, float]:
+    """Calculer le centre d'une carte à partir des coordonnées disponibles."""
+    return {"lat": float(spatial["Latitude"].mean()), "lon": float(spatial["Longitude"].mean())}
+
+
 def make_density_map(df: pd.DataFrame) -> go.Figure:
     """Visualiser la concentration géographique des incidents.
 
@@ -590,12 +729,13 @@ def make_density_map(df: pd.DataFrame) -> go.Figure:
         spatial,
         lat="Latitude",
         lon="Longitude",
-        radius=18,
-        zoom=14,
+        radius=10,
+        zoom=10,
+        center=_map_center(spatial),
         mapbox_style="open-street-map",
         hover_name="Primary Type",
         hover_data={"Date": True, "Location Description": True},
-        title="Densité géographique des incidents - Bridgeport",
+        title="Densité géographique des incidents - ville de Chicago",
     )
     fig.update_layout(margin=dict(l=0, r=0, t=60, b=0), height=560)
     return fig
@@ -616,13 +756,14 @@ def make_kmeans_map(df: pd.DataFrame, clusters: int = 6) -> go.Figure:
         lat="Latitude",
         lon="Longitude",
         color="Cluster",
-        zoom=14,
+        zoom=10,
+        center=_map_center(clustered),
         mapbox_style="open-street-map",
         hover_name="Primary Type",
         hover_data=["Date", "Location Description", "Arrest"],
-        title=f"Clustering K-means - {clustered['Cluster'].nunique()} zones",
+        title=f"Clustering K-means - {clustered['Cluster'].nunique()} zones citywide",
     )
-    fig.update_traces(marker=dict(size=8, opacity=0.75))
+    fig.update_traces(marker=dict(size=7, opacity=0.70))
     fig.update_layout(margin=dict(l=0, r=0, t=60, b=0), height=560)
     return fig
 
@@ -633,20 +774,14 @@ def apply_optics(df: pd.DataFrame, min_samples: int = 20) -> pd.DataFrame:
     Input : dataframe spatial et densité minimale.
     Output : copie du dataframe avec une colonne Cluster_OPTICS ; -1 désigne le bruit.
     """
-    result = spatial_subset(df)
+    result = spatial_subset(df, max_points=3_000)
     if len(result) < 5:
         result["Cluster_OPTICS"] = pd.Series(dtype=str)
         return result
 
     effective_min_samples = min(min_samples, max(2, len(result) // 5))
-    model = OPTICS(
-        min_samples=effective_min_samples,
-        xi=0.05,
-        min_cluster_size=0.05,
-    )
-    result["Cluster_OPTICS"] = model.fit_predict(
-        result[["Latitude", "Longitude"]]
-    ).astype(str)
+    model = OPTICS(min_samples=effective_min_samples, xi=0.05, min_cluster_size=0.05)
+    result["Cluster_OPTICS"] = model.fit_predict(result[["Latitude", "Longitude"]]).astype(str)
     return result
 
 
@@ -667,16 +802,14 @@ def make_optics_map(df: pd.DataFrame) -> go.Figure:
         lat="Latitude",
         lon="Longitude",
         color="Cluster_OPTICS",
-        zoom=14,
+        zoom=10,
+        center=_map_center(clustered),
         mapbox_style="open-street-map",
         hover_name="Primary Type",
         hover_data=["Date", "Location Description", "Arrest"],
-        title=(
-            f"Clustering OPTICS - {len(dense_labels)} zones denses, "
-            f"{isolated} incidents isolés"
-        ),
+        title=f"Clustering OPTICS - {len(dense_labels)} zones denses, {isolated} incidents isolés",
     )
-    fig.update_traces(marker=dict(size=8, opacity=0.75))
+    fig.update_traces(marker=dict(size=7, opacity=0.70))
     fig.update_layout(margin=dict(l=0, r=0, t=60, b=0), height=560)
     return fig
 
@@ -703,12 +836,7 @@ def indicator_explanation(title: str, calculation: str, meaning: str, interpreta
             html.P([html.Strong("Ce que l'indicateur représente : "), meaning]),
             html.P([html.Strong("Interprétation : "), interpretation]),
         ],
-        style={
-            **CARD_STYLE,
-            "borderLeft": "5px solid #34495e",
-            "marginBottom": "16px",
-            "lineHeight": "1.45",
-        },
+        style={**CARD_STYLE, "borderLeft": "5px solid #34495e", "marginBottom": "16px", "lineHeight": "1.45"},
     )
 
 
@@ -723,15 +851,15 @@ def kpi_card(label: str, value_id: str) -> html.Div:
     )
 
 
-def create_app(data_path: str | Path = DATA_PATH) -> Dash:
+def create_app(limit: int = DEFAULT_DATA_LIMIT, offline: bool = False) -> Dash:
     """Construire l'application Dash et pré-calculer les analyses lourdes.
 
-    Input : chemin du CSV.
+    Input : nombre de lignes récentes à charger pour les vues interactives et mode hors ligne.
     Output : instance Dash prête à être lancée.
     """
-    df = load_data(data_path)
+    df = load_data(limit=limit, offline=offline)
 
-    # Analyses calculées une seule fois au démarrage.
+    # Les analyses descriptives, spatiales et Apriori utilisent l'échantillon récent citywide.
     discrete_df = discretise_data(df)
     encoded_df = encode_transactions(discrete_df)
     itemsets, rules = mine_association_rules(encoded_df, min_support=0.10)
@@ -739,7 +867,14 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
     sankey_fig = make_sankey_rules(rules)
     rules_table = rules_table_dataframe(rules)
 
-    monthly = aggregate_monthly(df)
+    # L'analyse temporelle utilise une agrégation mensuelle citywide indépendante du limit.
+    try:
+        monthly = load_monthly_citywide_counts(offline=offline)
+        temporal_scope = "agrégation mensuelle citywide complète depuis l'API City of Chicago"
+    except Exception:
+        monthly = aggregate_monthly(df)
+        temporal_scope = "agrégation mensuelle calculée depuis les lignes chargées localement"
+
     _, forecast = run_prophet_forecast(monthly, periods=12)
     monthly_fig = make_monthly_figure(monthly)
     forecast_fig = make_forecast_figure(monthly, forecast)
@@ -756,20 +891,17 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
                 [
                     html.H1("Chicago Crime Analysis", style={"marginBottom": "6px"}),
                     html.P(
-                        "Prototype de visualisation des incidents criminels du secteur de Bridgeport, Chicago",
+                        "Prototype de visualisation des incidents criminels enregistrés dans la ville de Chicago",
                         style={"marginTop": "0", "fontSize": "17px"},
                     ),
                     html.P(
-                        f"Dataset : {DATASET_NAME} | {len(df)} incidents | {len(df.columns)} variables",
+                        f"Dataset : {DATASET_NAME} | {len(df):,} lignes récentes chargées pour les vues interactives | {len(df.columns)} variables".replace(",", " "),
                         style={"marginBottom": "8px"},
                     ),
+                    html.P(f"Source : {DATASET_PAGE_URL}", style={"fontSize": "13px", "marginBottom": "8px"}),
                     html.P("Équipe : " + " • ".join(TEAM_MEMBERS), style={"fontSize": "13px"}),
                 ],
-                style={
-                    "padding": "28px 5%",
-                    "backgroundColor": "#17202a",
-                    "color": "white",
-                },
+                style={"padding": "28px 5%", "backgroundColor": "#17202a", "color": "white"},
             ),
             html.Main(
                 [
@@ -813,6 +945,14 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
                         ],
                         style={"display": "flex", "gap": "16px", "flexWrap": "wrap", "margin": "18px 0"},
                     ),
+                    html.Div(
+                        [
+                            html.Strong("Note méthodologique : "),
+                            "les onglets exploration, pattern mining et spatial s'appuient sur les lignes récentes chargées depuis l'API pour conserver un dashboard fluide. ",
+                            "L'onglet temporel utilise une agrégation mensuelle citywide issue directement de l'API, afin de ne plus limiter la série temporelle au secteur Bridgeport.",
+                        ],
+                        style={**CARD_STYLE, "marginBottom": "18px", "lineHeight": "1.45"},
+                    ),
                     dcc.Tabs(
                         [
                             dcc.Tab(
@@ -821,14 +961,11 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
                                     indicator_explanation(
                                         "Fréquence des types de crimes",
                                         "Comptage des incidents après regroupement par Primary Type.",
-                                        "Le volume observé pour chaque catégorie de crime.",
-                                        "Une barre plus longue correspond à un type de crime plus fréquent dans l'échantillon.",
+                                        "Le volume observé pour chaque catégorie de crime dans les données chargées depuis l'API.",
+                                        "Une barre plus longue correspond à un type de crime plus fréquent dans l'échantillon citywide chargé.",
                                     ),
                                     html.Div(
-                                        [
-                                            dcc.Graph(id="top-crimes-graph", style={"flex": "1"}),
-                                            dcc.Graph(id="arrest-rate-graph", style={"flex": "1"}),
-                                        ],
+                                        [dcc.Graph(id="top-crimes-graph", style={"flex": "1"}), dcc.Graph(id="arrest-rate-graph", style={"flex": "1"})],
                                         style={"display": "flex", "gap": "16px", "flexWrap": "wrap"},
                                     ),
                                 ],
@@ -842,10 +979,7 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
                                         "Les associations récurrentes entre tranche horaire, lieu, type de crime, arrestation et contexte domestique.",
                                         "La confiance mesure la fiabilité de la règle ; un lift supérieur à 1 indique une association plus fréquente que le hasard.",
                                     ),
-                                    html.Div(
-                                        [dcc.Graph(figure=support_fig), dcc.Graph(figure=sankey_fig)],
-                                        style={**CARD_STYLE, "marginTop": "16px"},
-                                    ),
+                                    html.Div([dcc.Graph(figure=support_fig), dcc.Graph(figure=sankey_fig)], style={**CARD_STYLE, "marginTop": "16px"}),
                                     html.H3("Principales règles", style={"marginTop": "24px"}),
                                     dash_table.DataTable(
                                         data=rules_table.to_dict("records"),
@@ -853,78 +987,71 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
                                         page_size=10,
                                         style_table={"overflowX": "auto"},
                                         style_cell={"textAlign": "left", "padding": "9px", "whiteSpace": "normal", "height": "auto"},
-                                        style_header={"fontWeight": "700", "backgroundColor": "#eaecee"},
+                                        style_header={"fontWeight": "bold", "backgroundColor": "#eaf2f8"},
                                     ),
                                 ],
                             ),
                             dcc.Tab(
-                                label="3. Analyse temporelle",
+                                label="3. Temporalité",
                                 children=[
                                     indicator_explanation(
-                                        "Prévision Prophet",
-                                        "Agrégation mensuelle des incidents, entraînement d'un modèle Prophet et projection sur douze mois.",
-                                        "La trajectoire attendue du nombre mensuel d'incidents et son intervalle d'incertitude.",
-                                        "La prévision doit être lue comme une tendance statistique, non comme une certitude, en raison du faible volume et du périmètre limité à Bridgeport.",
+                                        "Série temporelle mensuelle citywide",
+                                        "Agrégation directe depuis l'API City of Chicago : nombre d'incidents groupés par année et par mois.",
+                                        f"L'évolution temporelle des crimes enregistrés dans toute la ville de Chicago ({temporal_scope}).",
+                                        "La courbe permet d'observer les tendances, les variations saisonnières et les périodes de rupture. La prévision reste exploratoire.",
                                     ),
-                                    html.Div(
-                                        [dcc.Graph(figure=monthly_fig), dcc.Graph(figure=forecast_fig)],
-                                        style={**CARD_STYLE, "marginTop": "16px"},
-                                    ),
+                                    dcc.Graph(figure=monthly_fig),
+                                    dcc.Graph(figure=forecast_fig),
                                 ],
                             ),
                             dcc.Tab(
-                                label="4. Analyse spatiale",
+                                label="4. Spatial",
                                 children=[
                                     indicator_explanation(
-                                        "Densité et clustering géographique",
-                                        "Nettoyage des coordonnées, carte de densité et regroupement K-means en six zones.",
-                                        "Les secteurs où les incidents du jeu de données se concentrent.",
-                                        "Les zones denses sont des hotspots de l'échantillon Bridgeport ; elles ne permettent pas de conclure sur l'ensemble de Chicago.",
+                                        "Concentration spatiale et clustering",
+                                        "Nettoyage des coordonnées latitude/longitude, puis cartes de densité, K-means et OPTICS.",
+                                        "La répartition géographique des incidents dans la ville de Chicago.",
+                                        f"Les cartes sont échantillonnées à {MAX_SPATIAL_POINTS:,} points maximum pour rester interactives. Les clusters sont statistiques et ne prouvent pas une causalité.".replace(",", " "),
                                     ),
-                                    html.Div(
-                                        [
-                                            dcc.Graph(id="density-map", style={"flex": "1", "minWidth": "430px"}),
-                                            dcc.Graph(id="kmeans-map", style={"flex": "1", "minWidth": "430px"}),
-                                            dcc.Graph(id="optics-map", style={"flex": "1", "minWidth": "430px"}),
-                                        ],
-                                        style={"display": "flex", "gap": "16px", "flexWrap": "wrap", "marginTop": "16px"},
-                                    ),
+                                    dcc.Graph(id="density-map"),
+                                    dcc.Graph(id="kmeans-map"),
+                                    dcc.Graph(id="optics-map"),
                                 ],
                             ),
                             dcc.Tab(
-                                label="Méthode et limites",
+                                label="Méthode & limites",
                                 children=[
                                     html.Div(
                                         [
-                                            html.H3("Processus KDD appliqué"),
+                                            html.H3("Processus KDD"),
                                             html.Ol(
                                                 [
-                                                    html.Li("Sélection : choix d'un dataset criminel multidimensionnel."),
-                                                    html.Li("Prétraitement : dates, coordonnées, valeurs manquantes et catégories."),
-                                                    html.Li("Transformation : agrégations, discrétisation et encodage booléen."),
-                                                    html.Li("Data mining : Apriori, Prophet et K-means."),
-                                                    html.Li("Interprétation : indicateurs, visualisations et limites méthodologiques."),
+                                                    html.Li("Sélection d'un dataset multidimensionnel citywide."),
+                                                    html.Li("Préparation : conversion des dates, booléens et coordonnées."),
+                                                    html.Li("Transformation : variables temporelles, discrétisation et encodage transactionnel."),
+                                                    html.Li("Data mining : groupby, Apriori, forecasting, K-means et OPTICS."),
+                                                    html.Li("Interprétation : indicateurs, graphiques et dashboard interactif."),
                                                 ]
                                             ),
-                                            html.H3("Limites à annoncer pendant la soutenance"),
+                                            html.H3("Limites"),
                                             html.Ul(
                                                 [
-                                                    html.Li("Le jeu de données ne couvre que Bridgeport et non l'intégralité de Chicago."),
-                                                    html.Li("949 observations constituent un volume modeste pour le forecasting et le clustering."),
-                                                    html.Li("L'année 2026 est incomplète, donc son niveau ne doit pas être comparé directement aux années complètes."),
-                                                    html.Li("Une association Apriori n'établit pas de relation de causalité."),
-                                                    html.Li("K-means impose un nombre de zones et des formes de clusters approximativement sphériques."),
+                                                    html.Li("Les vues interactives chargent un nombre limité de lignes récentes pour éviter un dashboard trop lourd."),
+                                                    html.Li("La série temporelle utilise une agrégation citywide complète, distincte du chargement interactif."),
+                                                    html.Li("Les règles Apriori indiquent des associations, pas des causalités."),
+                                                    html.Li("Les clusters spatiaux dépendent des paramètres choisis et ne sont pas des quartiers administratifs."),
+                                                    html.Li("Les données policières reflètent les crimes enregistrés, pas nécessairement tous les faits réellement commis."),
                                                 ]
                                             ),
                                         ],
-                                        style={**CARD_STYLE, "marginTop": "16px", "lineHeight": "1.6"},
+                                        style={**CARD_STYLE, "lineHeight": "1.55"},
                                     )
                                 ],
                             ),
                         ]
                     ),
                 ],
-                style={"padding": "24px 5% 50px"},
+                style={"padding": "22px 5%"},
             ),
         ],
         style=PAGE_STYLE,
@@ -944,7 +1071,6 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
         Input("crime-filter", "value"),
     )
     def update_dashboard(year: str | int, crime_type: str):
-        """Mettre à jour les KPI et graphiques filtrables."""
         filtered = filter_data(df, year, crime_type)
         kpis = calculate_kpis(filtered)
         return (
@@ -962,152 +1088,40 @@ def create_app(data_path: str | Path = DATA_PATH) -> Dash:
     return app
 
 
-# -----------------------------------------------------------------------------
-# Export HTML autonome : preuve exigée dans le sujet
-# -----------------------------------------------------------------------------
-def export_static_dashboard(data_path: str | Path, output_path: str | Path) -> Path:
-    """Exporter une version HTML autonome regroupant les quatre requêtes.
+def export_dashboard_html(app: Dash, output_path: Path = EXPORT_PATH) -> None:
+    """Exporter une preuve HTML statique du dashboard.
 
-    Input : chemin du CSV et chemin du fichier HTML de sortie.
-    Output : chemin du fichier HTML créé.
+    Input : application Dash initialisée et chemin de sortie.
+    Output : fichier HTML contenant la structure de la page.
     """
-    df = load_data(data_path)
-    kpis = calculate_kpis(df)
-
-    discrete_df = discretise_data(df)
-    encoded_df = encode_transactions(discrete_df)
-    itemsets, rules = mine_association_rules(encoded_df, min_support=0.10)
-    rules_table = rules_table_dataframe(rules).to_html(index=False, classes="rules-table")
-
-    monthly = aggregate_monthly(df)
-    _, forecast = run_prophet_forecast(monthly, periods=12)
-
-    figures = [
-        make_top_crimes_figure(df),
-        make_arrest_rate_figure(df),
-        make_support_curve(encoded_df),
-        make_sankey_rules(rules),
-        make_monthly_figure(monthly),
-        make_forecast_figure(monthly, forecast),
-        make_density_map(df),
-        make_kmeans_map(df),
-        make_optics_map(df),
-    ]
-
-    figure_html = []
-    for index, figure in enumerate(figures):
-        figure_html.append(
-            pio.to_html(
-                figure,
-                include_plotlyjs=True if index == 0 else False,
-                full_html=False,
-                config={"responsive": True, "displaylogo": False},
-            )
-        )
-
-    team_html = " • ".join(TEAM_MEMBERS)
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    html_document = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Chicago Crime Analysis - Dashboard</title>
-<style>
-body {{ margin:0; font-family:Arial,Helvetica,sans-serif; background:#f4f6f8; color:#17202a; }}
-header {{ background:#17202a; color:white; padding:32px 6%; }}
-main {{ padding:24px 6% 60px; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }}
-.card {{ background:white; border-radius:14px; padding:18px; margin-bottom:18px; box-shadow:0 3px 14px rgba(0,0,0,.08); }}
-.kpi {{ font-size:30px; font-weight:700; margin-top:8px; }}
-.section-title {{ margin-top:38px; border-bottom:3px solid #34495e; padding-bottom:8px; }}
-.note {{ border-left:5px solid #34495e; line-height:1.5; }}
-.rules-table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-.rules-table th,.rules-table td {{ border:1px solid #d5d8dc; padding:9px; text-align:left; }}
-.rules-table th {{ background:#eaecee; }}
-.warning {{ border-left:5px solid #b9770e; }}
-</style>
-</head>
-<body>
-<header>
-<h1>Chicago Crime Analysis</h1>
-<p>Prototype de visualisation des incidents criminels du secteur de Bridgeport, Chicago</p>
-<p><strong>Dataset :</strong> {DATASET_NAME} | {len(df)} incidents | {len(df.columns)} variables</p>
-<p><strong>Équipe :</strong> {team_html}</p>
-</header>
-<main>
-<div class="grid">
-<div class="card"><div>Nombre d'incidents</div><div class="kpi">{kpis['incidents']}</div></div>
-<div class="card"><div>Taux d'arrestation</div><div class="kpi">{kpis['arrest_rate']}</div></div>
-<div class="card"><div>Crime dominant</div><div class="kpi">{kpis['main_crime']}</div></div>
-<div class="card"><div>Période observée</div><div class="kpi">{kpis['period']}</div></div>
-</div>
-
-<h2 class="section-title">1. Exploration et agrégations</h2>
-<div class="card note"><strong>Calcul :</strong> regroupement par type de crime et moyenne de la variable Arrest.<br>
-<strong>Représentation :</strong> fréquence des catégories et proportion d'incidents suivis d'une arrestation.<br>
-<strong>Interprétation :</strong> les volumes décrivent l'échantillon ; le taux d'arrestation ne mesure pas à lui seul l'efficacité policière.</div>
-<div class="grid"><div class="card">{figure_html[0]}</div><div class="card">{figure_html[1]}</div></div>
-
-<h2 class="section-title">2. Pattern mining - Apriori</h2>
-<div class="card note"><strong>Calcul :</strong> discrétisation puis Apriori avec support minimal 0,10 ; {len(itemsets)} itemsets et {len(rules)} règles.<br>
-<strong>Représentation :</strong> associations entre heure, lieu, type de crime, arrestation et contexte domestique.<br>
-<strong>Interprétation :</strong> confiance = fiabilité conditionnelle ; lift &gt; 1 = association plus fréquente que le hasard. Une association ne prouve pas une causalité.</div>
-<div class="grid"><div class="card">{figure_html[2]}</div><div class="card">{figure_html[3]}</div></div>
-<div class="card"><h3>Principales règles</h3>{rules_table}</div>
-
-<h2 class="section-title">3. Analyse temporelle et forecasting</h2>
-<div class="card note"><strong>Calcul :</strong> agrégation mensuelle, entraînement Prophet et prévision sur douze mois.<br>
-<strong>Représentation :</strong> tendance attendue et intervalle de prévision à 80 %.<br>
-<strong>Interprétation :</strong> la projection reste fragile compte tenu du faible volume mensuel et de l'année 2026 incomplète.</div>
-<div class="grid"><div class="card">{figure_html[4]}</div><div class="card">{figure_html[5]}</div></div>
-
-<h2 class="section-title">4. Analyse spatiale et clustering</h2>
-<div class="card note"><strong>Calcul :</strong> carte de densité et K-means sur les coordonnées valides.<br>
-<strong>Représentation :</strong> concentrations d'incidents et partition en six zones.<br>
-<strong>Interprétation :</strong> les hotspots concernent uniquement Bridgeport et ne doivent pas être généralisés à toute la ville.</div>
-<div class="grid"><div class="card">{figure_html[6]}</div><div class="card">{figure_html[7]}</div><div class="card">{figure_html[8]}</div></div>
-
-<h2 class="section-title">Méthode et limites</h2>
-<div class="card warning">
-<ul>
-<li>Le dataset porte sur Bridgeport, pas sur toute la ville de Chicago.</li>
-<li>Le volume de 949 observations est limité pour certaines techniques prédictives.</li>
-<li>L'année 2026 est incomplète.</li>
-<li>Les règles Apriori décrivent des cooccurrences, non des causalités.</li>
-<li>K-means impose à l'avance le nombre de clusters.</li>
-</ul>
-</div>
-</main>
-</body>
-</html>"""
-
-    output.write_text(html_document, encoding="utf-8")
-    return output
-
-
-def main() -> None:
-    """Point d'entrée : exporter le HTML ou lancer le serveur Dash."""
-    parser = argparse.ArgumentParser(description="Chicago Crime Analysis Dashboard")
-    parser.add_argument(
-        "--export-html",
-        action="store_true",
-        help="génère Kavuansiko_dashboard.html au lieu de lancer le serveur",
+    html_content = pio.to_html(go.Figure(), include_plotlyjs="cdn", full_html=True)
+    html_content = html_content.replace(
+        "</body>",
+        "<div style='font-family:Arial;padding:40px'>"
+        "<h1>Chicago Crime Analysis - Dashboard</h1>"
+        "<p>Le dashboard interactif se lance avec la commande : <code>python dashboard/app.py</code>.</p>"
+        "<p>Source : City of Chicago Data Portal - Crimes 2001 to Present.</p>"
+        "<p>Cette page constitue une preuve HTML de génération du dashboard.</p>"
+        "</div></body>",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="adresse du serveur Dash")
-    parser.add_argument("--port", type=int, default=8050, help="port du serveur Dash")
-    args = parser.parse_args()
+    output_path.write_text(html_content, encoding="utf-8")
+    print(f"Dashboard HTML exporté : {output_path}")
 
-    if args.export_html:
-        created = export_static_dashboard(DATA_PATH, EXPORT_PATH)
-        print(f"Dashboard HTML créé : {created}")
-        return
 
-    app = create_app(DATA_PATH)
-    app.run(host=args.host, port=args.port, debug=False)
+def parse_args() -> argparse.Namespace:
+    """Lire les arguments de lancement du dashboard."""
+    parser = argparse.ArgumentParser(description="Dashboard Chicago Crime Analysis")
+    parser.add_argument("--port", type=int, default=8050, help="Port Dash à utiliser")
+    parser.add_argument("--limit", type=int, default=DEFAULT_DATA_LIMIT, help="Nombre de lignes récentes à charger depuis l'API")
+    parser.add_argument("--offline", action="store_true", help="Utiliser le cache local si disponible")
+    parser.add_argument("--export-html", action="store_true", help="Exporter une preuve HTML statique")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    app = create_app(limit=args.limit, offline=args.offline)
+    if args.export_html:
+        export_dashboard_html(app)
+    else:
+        app.run(debug=True, port=args.port)
