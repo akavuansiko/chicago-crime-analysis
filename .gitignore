@@ -1,0 +1,8 @@
+notebooks/carte_densite_crimes.png
+notebooks/spatial_analysis_v2_api.ipynb
+.DS_Store
+.idea/
+anaconda_projects/
+*.db
+data/chicago_crimes_citywide_cache.csv
+data/chicago_monthly_citywide_cache.csv
